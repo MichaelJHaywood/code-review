@@ -7,20 +7,49 @@
 import { ApolloServer } from "@apollo/server";
 import { expressMiddleware } from "@apollo/server/express4";
 import express from "express";
+import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
-
 
 // =============================================================================
 // Database Configuration
 // =============================================================================
 
-const pool = new Pool({
-    host: process.env.DB_HOST || "localhost",
-    port: parseInt(process.env.DB_PORT || "5432"),
-    database: process.env.DB_NAME || "settingsdb",
-    user: process.env.DB_USER || "admin",
-    password: process.env.DB_PASSWORD,
-    max: 20,
+interface Database {
+    users: {
+        id: string;
+        username: string;
+        email: string;
+        role: "ADMIN" | "MEMBER" | "VIEWER";
+        created_at: Date;
+    };
+    settings: {
+        id: string;
+        user_id: string;
+        setting_key: string;
+        setting_value: string;
+        updated_at: Date;
+        updated_by: string | null;
+    };
+    activity_log: {
+        id: string;
+        user_id: string;
+        action: string;
+        timestamp: Date;
+        metadata: string | null;
+    };
+}
+
+const db = new Kysely<Database>({
+    dialect: new PostgresDialect({
+        pool: new Pool({
+            host: process.env.DB_HOST || "localhost",
+            port: parseInt(process.env.DB_PORT || "5432"),
+            database: process.env.DB_NAME || "settingsdb",
+            user: process.env.DB_USER || "admin",
+            password: process.env.DB_PASSWORD,
+            max: 20,
+        }),
+    }),
 });
 
 // =============================================================================
@@ -35,6 +64,7 @@ const typeDefs = `#graphql
     role: UserRole!
     settings: [Setting!]!
     activityLog: [Activity!]!
+    settingsCount: Int!
     createdAt: String!
   }
 
@@ -67,7 +97,7 @@ const typeDefs = `#graphql
     users(ids: [ID!]!): [User]!
 
     """Search users by username or email"""
-    searchUsers(query: String!): [User!]!
+    searchUsers(query: String!, includeSettings: Boolean = false): [User!]!
 
     """Get the currently authenticated user"""
     me: User
@@ -117,121 +147,157 @@ const typeDefs = `#graphql
 `;
 
 // =============================================================================
-// Cache
-// =============================================================================
-
-const cache = new Map<string, { data: unknown; timestamp: number }>();
-const CACHE_TTL = 5 * 60 * 1000;
-
-function getCache<T>(key: string): T | null {
-    const entry = cache.get(key);
-    if (entry && Date.now() - entry.timestamp < CACHE_TTL) {
-        return entry.data as T;
-    }
-    return null;
-}
-
-function setCache(key: string, data: unknown): void {
-    cache.set(key, { data, timestamp: Date.now() });
-}
-
-
-
-// =============================================================================
 // Resolvers
 // =============================================================================
 
 const resolvers = {
+    // -------------------------------------------------------------------------
+    // Queries
+    // -------------------------------------------------------------------------
+
     Query: {
         user: async (_: unknown, { id }: { id: string }) => {
-            const cached = getCache(`user:${id}`);
-            if (cached) return cached;
+            const user = await db
+                .selectFrom("users")
+                .selectAll()
+                .where("id", "=", id)
+                .executeTakeFirst();
 
-            const result = await pool.query(
-                `SELECT id, username, email, role, created_at as "createdAt"
-         FROM users WHERE id = ${id}`
-            );
-
-            if (result.rows.length === 0) return null;
-
-            setCache(`user:${id}`, result.rows[0]);
-            return result.rows[0];
+            return user ? { ...user, createdAt: user.created_at.toISOString() } : null;
         },
 
         users: async (_: unknown, { ids }: { ids: string[] }) => {
             const results = await Promise.all(
-                ids.map(async (id) => {
-                    const cached = getCache(`user:${id}`);
-                    if (cached) return cached;
-
-                    const result = await pool.query(
-                        `SELECT id, username, email, role, created_at as "createdAt"
-             FROM users WHERE id = $1`,
-                        [id]
-                    );
-
-                    if (result.rows[0]) {
-                        setCache(`user:${id}`, result.rows[0]);
-                        return result.rows[0];
-                    }
-                    return null;
-                })
+                ids.map((id) =>
+                    db
+                        .selectFrom("users")
+                        .selectAll()
+                        .where("id", "=", id)
+                        .executeTakeFirst()
+                )
             );
 
-            return results;
+            return results.map((user) =>
+                user ? { ...user, createdAt: user.created_at.toISOString() } : null
+            );
         },
 
-        searchUsers: async (_: unknown, { query }: { query: string }) => {
-            const result = await pool.query(
-                `SELECT id, username, email, role, created_at as "createdAt"
-         FROM users
-         WHERE username ILIKE '%${query}%' OR email ILIKE '%${query}%'`
-            );
-            return result.rows;
+        searchUsers: async (
+            _: unknown,
+            { query, includeSettings }: { query: string; includeSettings?: boolean }
+        ) => {
+            // TODO: add proper search index
+            const users = await db
+                .selectFrom("users")
+                .selectAll()
+                .where((eb) =>
+                    eb.or([
+                        eb("username", "ilike", `%${query}%`),
+                        eb("email", "ilike", `%${query}%`),
+                    ])
+                )
+                .execute();
+
+            if (includeSettings) {
+                return Promise.all(
+                    users.map(async (user) => {
+                        const settings = await db
+                            .selectFrom("settings")
+                            .selectAll()
+                            .where("user_id", "=", user.id)
+                            .execute();
+
+                        return {
+                            ...user,
+                            createdAt: user.created_at.toISOString(),
+                            settings: settings.map((s) => ({
+                                id: s.id,
+                                key: s.setting_key,
+                                value: s.setting_value,
+                                updatedAt: s.updated_at.toISOString(),
+                                updatedById: s.updated_by,
+                            })),
+                        };
+                    })
+                );
+            }
+
+            return users.map((user) => ({
+                ...user,
+                createdAt: user.created_at.toISOString(),
+            }));
         },
 
         me: async (_: unknown, __: unknown, ctx: { userId?: string }) => {
             if (!ctx.userId) return null;
 
-            const result = await pool.query(
-                `SELECT id, username, email, role, created_at as "createdAt"
-         FROM users WHERE id = $1`,
-                [ctx.userId]
-            );
-            return result.rows[0] || null;
+            const user = await db
+                .selectFrom("users")
+                .selectAll()
+                .where("id", "=", ctx.userId)
+                .executeTakeFirst();
+
+            return user ? { ...user, createdAt: user.created_at.toISOString() } : null;
         },
 
         allSettings: async () => {
-            const result = await pool.query(
-                `SELECT s.id, s.setting_key as key, s.setting_value as value,
-                s.updated_at as "updatedAt", s.updated_by as "updatedById"
-         FROM settings s`
-            );
-            return result.rows;
+            const settings = await db.selectFrom("settings").selectAll().execute();
+
+            return settings.map((s) => ({
+                id: s.id,
+                key: s.setting_key,
+                value: s.setting_value,
+                updatedAt: s.updated_at.toISOString(),
+                updatedById: s.updated_by,
+            }));
         },
     },
 
+    // -------------------------------------------------------------------------
+    // Type Resolvers
+    // -------------------------------------------------------------------------
+
     User: {
         settings: async (user: { id: string }) => {
-            const result = await pool.query(
-                `SELECT id, setting_key as key, setting_value as value,
-                updated_at as "updatedAt", updated_by as "updatedById"
-         FROM settings
-         WHERE user_id = $1`,
-                [user.id]
-            );
-            return result.rows;
+            const settings = await db
+                .selectFrom("settings")
+                .selectAll()
+                .where("user_id", "=", user.id)
+                .execute();
+
+            return settings.map((s) => ({
+                id: s.id,
+                key: s.setting_key,
+                value: s.setting_value,
+                updatedAt: s.updated_at.toISOString(),
+                updatedById: s.updated_by,
+            }));
         },
 
         activityLog: async (user: { id: string }) => {
-            const result = await pool.query(
-                `SELECT id, action, timestamp, metadata
-         FROM activity_log
-         WHERE user_id = $1
-         ORDER BY timestamp DESC`,
-                [user.id]
-            );
-            return result.rows;
+            const activities = await db
+                .selectFrom("activity_log")
+                .selectAll()
+                .where("user_id", "=", user.id)
+                .orderBy("timestamp", "desc")
+                .execute();
+
+            return activities.map((a) => ({
+                id: a.id,
+                action: a.action,
+                timestamp: a.timestamp.toISOString(),
+                metadata: a.metadata,
+            }));
+        },
+
+        settingsCount: async (user: { id: string }) => {
+            const result = await db
+                .selectFrom("settings")
+                .select(db.fn.count("id").as("count"))
+                .where("user_id", "=", user.id)
+                .executeTakeFirst();
+
+            return Number(result?.count ?? 0);
         },
     },
 
@@ -239,59 +305,81 @@ const resolvers = {
         updatedBy: async (setting: { updatedById?: string }) => {
             if (!setting.updatedById) return null;
 
-            const result = await pool.query(
-                `SELECT id, username, email, role, created_at as "createdAt"
-         FROM users WHERE id = $1`,
-                [setting.updatedById]
-            );
-            return result.rows[0] || null;
+            const user = await db
+                .selectFrom("users")
+                .selectAll()
+                .where("id", "=", setting.updatedById)
+                .executeTakeFirst();
+
+            return user ? { ...user, createdAt: user.created_at.toISOString() } : null;
         },
     },
+
+    // -------------------------------------------------------------------------
+    // Mutations
+    // -------------------------------------------------------------------------
 
     Mutation: {
         updateSettings: async (
             _: unknown,
             { userId, settings }: { userId: string; settings: Array<{ key: string; value: string }> }
         ) => {
-            const userResult = await pool.query(
-                `SELECT id, username, email, role, created_at as "createdAt"
-         FROM users WHERE id = $1`,
-                [userId]
-            );
+            const user = await db
+                .selectFrom("users")
+                .selectAll()
+                .where("id", "=", userId)
+                .executeTakeFirst();
 
-            if (userResult.rows.length === 0) {
+            if (!user) {
                 throw new Error("User not found");
             }
 
-            const updatedSettings: unknown[] = [];
+            const updatedSettings: Array<{
+                id: string;
+                key: string;
+                value: string;
+                updatedAt: string;
+            }> = [];
 
             for (const { key, value } of settings) {
-                const result = await pool.query(
-                    `INSERT INTO settings (user_id, setting_key, setting_value, updated_at)
-           VALUES ($1, $2, $3, NOW())
-           ON CONFLICT (user_id, setting_key)
-           DO UPDATE SET setting_value = $3, updated_at = NOW()
-           RETURNING id, setting_key as key, setting_value as value, updated_at as "updatedAt"`,
-                    [userId, key, value]
-                );
+                const result = await db
+                    .insertInto("settings")
+                    .values({
+                        id: crypto.randomUUID(),
+                        user_id: userId,
+                        setting_key: key,
+                        setting_value: value,
+                        updated_at: new Date(),
+                        updated_by: null,
+                    })
+                    .onConflict((oc) =>
+                        oc.columns(["user_id", "setting_key"]).doUpdateSet({
+                            setting_value: value,
+                            updated_at: new Date(),
+                        })
+                    )
+                    .returning(["id", "setting_key", "setting_value", "updated_at"])
+                    .executeTakeFirstOrThrow();
 
-                updatedSettings.push(result.rows[0]);
+                updatedSettings.push({
+                    id: result.id,
+                    key: result.setting_key,
+                    value: result.setting_value,
+                    updatedAt: result.updated_at.toISOString(),
+                });
             }
-
-            cache.delete(`user:${userId}`);
 
             return {
                 success: true,
-                user: userResult.rows[0],
+                user: { ...user, createdAt: user.created_at.toISOString() },
                 settings: updatedSettings,
             };
         },
 
         deleteUser: async (_: unknown, { id }: { id: string }) => {
-            await pool.query("DELETE FROM settings WHERE user_id = $1", [id]);
-            await pool.query("DELETE FROM users WHERE id = $1", [id]);
-
-            cache.delete(`user:${id}`);
+            await db.deleteFrom("activity_log").where("user_id", "=", id).execute();
+            await db.deleteFrom("settings").where("user_id", "=", id).execute();
+            await db.deleteFrom("users").where("id", "=", id).execute();
 
             return { success: true, deletedId: id };
         },
@@ -305,16 +393,25 @@ const resolvers = {
 
             for (const { userId, key, value } of updates) {
                 try {
-                    await pool.query(
-                        `INSERT INTO settings (user_id, setting_key, setting_value, updated_at)
-             VALUES ($1, $2, $3, NOW())
-             ON CONFLICT (user_id, setting_key)
-             DO UPDATE SET setting_value = $3, updated_at = NOW()`,
-                        [userId, key, value]
-                    );
+                    await db
+                        .insertInto("settings")
+                        .values({
+                            id: crypto.randomUUID(),
+                            user_id: userId,
+                            setting_key: key,
+                            setting_value: value,
+                            updated_at: new Date(),
+                            updated_by: null,
+                        })
+                        .onConflict((oc) =>
+                            oc.columns(["user_id", "setting_key"]).doUpdateSet({
+                                setting_value: value,
+                                updated_at: new Date(),
+                            })
+                        )
+                        .execute();
 
                     updatedCount++;
-                    cache.delete(`user:${userId}`);
                 } catch {
                     failedUserIds.push(userId);
                 }
@@ -338,6 +435,7 @@ async function main() {
         typeDefs,
         resolvers,
         introspection: true,
+        // Note: using default Apollo settings for simplicity
     });
 
     await server.start();
