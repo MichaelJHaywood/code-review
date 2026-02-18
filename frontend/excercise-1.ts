@@ -24,8 +24,3 @@ export const schemaValidator =
 // <Form.Item name="schema" rules={[{ validator: schemaValidator(validateQuery) }]}>
 //   <TextArea rows={10} />
 // </Form.Item>
-
-// Discussion Points:
-// * "Users complain the form is slow and laggy. What's causing this?"
-// * "How would you optimize this?"
-// * "What if the user types fast - how many requests are made?"
